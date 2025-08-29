@@ -1,0 +1,8 @@
+metadata:
+  max_duration_hours: 15
+
+itineraries:
+  - from: JFK
+    to: SFO
+    target_date: 2025-12-20
+    currency: USD

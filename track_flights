@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+import sys
+import yaml
+import argparse
+import json
+import os
+from datetime import datetime
+from amadeus import Client, ResponseError
+
+def load_secrets(environment):
+    """Load API credentials from secrets file"""
+    secrets_file = f"secrets-{environment}.yaml"
+    try:
+        with open(secrets_file, 'r') as f:
+            secrets = yaml.safe_load(f)
+        return secrets['api_key'], secrets['api_secret']
+    except FileNotFoundError:
+        print(f"Error: {secrets_file} not found")
+        sys.exit(1)
+    except KeyError as e:
+        print(f"Error: Missing key {e} in {secrets_file}")
+        sys.exit(1)
+
+def load_config():
+    """Load flight search configuration"""
+    try:
+        with open('config.yaml', 'r') as f:
+            config_data = yaml.safe_load(f)
+            
+        # Extract metadata and itineraries
+        metadata = config_data.get('metadata', {})
+        itineraries = config_data.get('itineraries', [])
+        
+        # Set default max duration if not specified
+        if 'max_duration_hours' not in metadata:
+            metadata['max_duration_hours'] = 10
+            
+        return metadata, itineraries
+    except FileNotFoundError:
+        print("Error: config.yaml not found")
+        sys.exit(1)
+    except KeyError as e:
+        print(f"Error: Invalid config structure - {e}")
+        sys.exit(1)
+
+def search_flights(amadeus_client, route_config):
+    """Search for flights using Amadeus API"""
+    try:
+        # Build search parameters
+        search_params = {
+            'originLocationCode': route_config['from'],
+            'destinationLocationCode': route_config['to'],
+            'departureDate': route_config['target_date'],
+            'adults': 1,
+            'currencyCode': route_config.get('currency', 'USD'),
+            'max': 250  # Maximum number of flight offers to return
+        }
+        
+        # Add max stops if specified
+        if 'max_stops' in route_config:
+            if route_config['max_stops'] == 0:
+                search_params['nonStop'] = True
+        
+        # Search for flights
+        response = amadeus_client.shopping.flight_offers_search.get(**search_params)
+        return response.data
+        
+    except ResponseError as error:
+        print(f"API Error: {error}")
+        if hasattr(error, 'response') and hasattr(error.response, 'body'):
+            print(f"Error details: {error.response.body}")
+        return None
+
+def parse_duration_to_hours(duration_str):
+    """Parse ISO 8601 duration to total hours as float"""
+    if not duration_str:
+        return 0.0
+    
+    # Simple parser for PT format (e.g., "PT2H30M")
+    duration_str = duration_str.replace('PT', '')
+    hours = 0
+    minutes = 0
+    
+    if 'H' in duration_str:
+        parts = duration_str.split('H')
+        hours = int(parts[0])
+        if len(parts) > 1 and 'M' in parts[1]:
+            minutes = int(parts[1].replace('M', ''))
+    elif 'M' in duration_str:
+        minutes = int(duration_str.replace('M', ''))
+    
+    return hours + (minutes / 60.0)
+
+def format_duration(duration_str):
+    """Format ISO 8601 duration to readable format"""
+    if not duration_str:
+        return "N/A"
+    
+    # Simple parser for PT format (e.g., "PT2H30M")
+    duration_str = duration_str.replace('PT', '')
+    hours = 0
+    minutes = 0
+    
+    if 'H' in duration_str:
+        parts = duration_str.split('H')
+        hours = int(parts[0])
+        if len(parts) > 1 and 'M' in parts[1]:
+            minutes = int(parts[1].replace('M', ''))
+    elif 'M' in duration_str:
+        minutes = int(duration_str.replace('M', ''))
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
+
+def filter_flights_by_duration(flights, max_duration_hours, route_max_duration=None):
+    """Filter flights based on maximum duration"""
+    if not flights:
+        return flights
+    
+    # Use route-specific max duration if provided, otherwise use global
+    max_hours = route_max_duration if route_max_duration is not None else max_duration_hours
+    
+    filtered_flights = []
+    for flight_offer in flights:
+        for itinerary in flight_offer['itineraries']:
+            duration_str = itinerary.get('duration', '')
+            duration_hours = parse_duration_to_hours(duration_str)
+            
+            # Only include flights within the duration limit
+            if duration_hours <= max_hours:
+                filtered_flights.append(flight_offer)
+                break  # Only need to check one itinerary per flight offer
+    
+    return filtered_flights
+
+def display_flight_info(flights, route_config):
+    """Display flight information in a formatted table"""
+    if not flights:
+        print("No flights found")
+        return
+    
+    print(f"\nFlights from {route_config['from']} to {route_config['to']} on {route_config['target_date']}")
+    print("=" * 135)
+    print(f"{'Airline':<15} {'Flight':<15} {'Departure':<12} {'Arrival':<12} {'Next Day':<9} {'Duration':<10} {'Stops':<6} {'Price':<12} {'Fare Code':<15}")
+    print("-" * 135)
+    
+    for flight_offer in flights:
+        price = f"{flight_offer['price']['total']} {flight_offer['price']['currency']}"
+        
+        for itinerary in flight_offer['itineraries']:
+            if not itinerary['segments']:
+                continue
+                
+            # Get first and last segments for complete trip info
+            first_segment = itinerary['segments'][0]
+            last_segment = itinerary['segments'][-1]
+            
+            # Extract flight information from first segment
+            airline_code = first_segment['carrierCode']
+            
+            # Create flight number list for multi-segment trips
+            if len(itinerary['segments']) == 1:
+                flight_number = f"{first_segment['carrierCode']}{first_segment['number']}"
+            else:
+                flight_numbers = [f"{seg['carrierCode']}{seg['number']}" for seg in itinerary['segments']]
+                flight_number = " + ".join(flight_numbers[:2])  # Show first two flights
+                if len(flight_numbers) > 2:
+                    flight_number += "..."
+            
+            # Times from first departure and final arrival
+            departure_time = first_segment['departure']['at'].split('T')[1][:5]
+            arrival_time = last_segment['arrival']['at'].split('T')[1][:5]
+            
+            # Check if arrival is next day
+            departure_date = first_segment['departure']['at'].split('T')[0]
+            arrival_date = last_segment['arrival']['at'].split('T')[0]
+            next_day = "Yes" if departure_date != arrival_date else "No"
+            
+            # Total duration from itinerary
+            duration = format_duration(itinerary.get('duration', ''))
+            
+            # Number of stops
+            stops = len(itinerary['segments']) - 1
+            
+            # Extract fare information from first segment
+            fare_code = "N/A"
+            if 'travelerPricings' in flight_offer:
+                for traveler in flight_offer['travelerPricings']:
+                    if 'fareDetailsBySegment' in traveler:
+                        for fare_detail in traveler['fareDetailsBySegment']:
+                            if fare_detail['segmentId'] == first_segment['id']:
+                                fare_code = fare_detail.get('fareBasis', 'N/A')
+                                break
+            
+            print(f"{airline_code:<15} {flight_number:<15} {departure_time:<12} {arrival_time:<12} {next_day:<9} {duration:<10} {stops:<6} {price:<12} {fare_code:<15}")
+
+def convert_flights_to_json(flights, route_config):
+    """Convert flight data to JSON-serializable format"""
+    if not flights:
+        return []
+    
+    json_flights = []
+    
+    for flight_offer in flights:
+        for itinerary in flight_offer['itineraries']:
+            if not itinerary['segments']:
+                continue
+                
+            # Get first and last segments for complete trip info
+            first_segment = itinerary['segments'][0]
+            last_segment = itinerary['segments'][-1]
+            
+            # Extract flight information
+            airline_code = first_segment['carrierCode']
+            
+            # Create flight number list for multi-segment trips
+            if len(itinerary['segments']) == 1:
+                flight_number = f"{first_segment['carrierCode']}{first_segment['number']}"
+                flight_numbers = [flight_number]
+            else:
+                flight_numbers = [f"{seg['carrierCode']}{seg['number']}" for seg in itinerary['segments']]
+                flight_number = " + ".join(flight_numbers[:2])
+                if len(flight_numbers) > 2:
+                    flight_number += "..."
+            
+            # Times and dates
+            departure_datetime = first_segment['departure']['at']
+            arrival_datetime = last_segment['arrival']['at']
+            departure_time = departure_datetime.split('T')[1][:5]
+            arrival_time = arrival_datetime.split('T')[1][:5]
+            departure_date = departure_datetime.split('T')[0]
+            arrival_date = arrival_datetime.split('T')[0]
+            next_day = departure_date != arrival_date
+            
+            # Duration
+            duration = itinerary.get('duration', '')
+            
+            # Number of stops
+            stops = len(itinerary['segments']) - 1
+            
+            # Extract fare information
+            fare_code = "N/A"
+            if 'travelerPricings' in flight_offer:
+                for traveler in flight_offer['travelerPricings']:
+                    if 'fareDetailsBySegment' in traveler:
+                        for fare_detail in traveler['fareDetailsBySegment']:
+                            if fare_detail['segmentId'] == first_segment['id']:
+                                fare_code = fare_detail.get('fareBasis', 'N/A')
+                                break
+            
+            flight_data = {
+                "airline_code": airline_code,
+                "flight_number": flight_number,
+                "flight_numbers": flight_numbers,
+                "departure_datetime": departure_datetime,
+                "arrival_datetime": arrival_datetime,
+                "departure_time": departure_time,
+                "arrival_time": arrival_time,
+                "departure_date": departure_date,
+                "arrival_date": arrival_date,
+                "next_day": next_day,
+                "duration": duration,
+                "stops": stops,
+                "price": flight_offer['price']['total'],
+                "currency": flight_offer['price']['currency'],
+                "fare_code": fare_code,
+                "segments": [
+                    {
+                        "carrier_code": seg['carrierCode'],
+                        "flight_number": seg['number'],
+                        "departure_datetime": seg['departure']['at'],
+                        "departure_iata_code": seg['departure']['iataCode'],
+                        "arrival_datetime": seg['arrival']['at'],
+                        "arrival_iata_code": seg['arrival']['iataCode'],
+                        "duration": seg.get('duration', '')
+                    }
+                    for seg in itinerary['segments']
+                ]
+            }
+            json_flights.append(flight_data)
+    
+    return json_flights
+
+def main():
+    parser = argparse.ArgumentParser(description='Track flight prices using Amadeus API')
+    parser.add_argument('environment', choices=['test', 'prod'], 
+                       help='Environment to use (test or prod)')
+    parser.add_argument('output_dir', 
+                       help='Base output directory (will be suffixed with -[environment])')
+    
+    args = parser.parse_args()
+    
+    # Create environment-specific output directory
+    output_dir = f"{args.output_dir.rstrip('/')}-{args.environment}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load credentials and configuration
+    api_key, api_secret = load_secrets(args.environment)
+    config_metadata, itineraries = load_config()
+    
+    # Initialize Amadeus client
+    amadeus_client = Client(
+        client_id=api_key,
+        client_secret=api_secret,
+        hostname='test' if args.environment == 'test' else 'production'
+    )
+    
+    # Prepare JSON output structure
+    now = datetime.now()
+    json_output = {
+        "metadata": {
+            "script_run_time": now.strftime('%Y-%m-%d %H:%M:%S'),
+            "environment": args.environment,
+            "config_file": "config.yaml",
+            "max_duration_hours": config_metadata.get('max_duration_hours', 10)
+        },
+        "routes": []
+    }
+    
+    print(f"Flight Price Tracker - {args.environment.upper()} Environment")
+    print(f"Timestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Output directory: {output_dir}")
+    print(f"Max duration filter: {config_metadata.get('max_duration_hours', 10)} hours")
+    
+    # Process each route in the configuration
+    for route in itineraries:
+        flights = search_flights(amadeus_client, route)
+        
+        # Apply duration filtering
+        route_max_duration = route.get('max_duration_hours')
+        global_max_duration = config_metadata.get('max_duration_hours', 10)
+        filtered_flights = filter_flights_by_duration(flights, global_max_duration, route_max_duration)
+        
+        # Show filtering results
+        if flights and len(filtered_flights) != len(flights):
+            max_used = route_max_duration if route_max_duration is not None else global_max_duration
+            print(f"Filtered {len(flights) - len(filtered_flights)} flights longer than {max_used} hours")
+        
+        display_flight_info(filtered_flights, route)
+        print()
+        
+        # Convert flights to JSON format and add to output
+        json_flights = convert_flights_to_json(filtered_flights, route)
+        
+        # Ensure route config is JSON-serializable
+        json_route = {}
+        for key, value in route.items():
+            if isinstance(value, (str, int, float, bool)):
+                json_route[key] = value
+            elif isinstance(value, list):
+                json_route[key] = value
+            else:
+                json_route[key] = str(value)
+        
+        route_data = {
+            "route": json_route,
+            "flights": json_flights,
+            "flight_count": len(json_flights)
+        }
+        json_output["routes"].append(route_data)
+    
+    # Write JSON output to file
+    output_file = os.path.join(output_dir, f"{now.strftime('%Y-%m-%d')}.json")
+    with open(output_file, 'w') as f:
+        json.dump(json_output, f, indent=2)
+    
+    print(f"Flight data saved to: {output_file}")
+
+if __name__ == "__main__":
+    main()

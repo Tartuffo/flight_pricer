@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import glob
+import argparse
+from datetime import datetime
+
+def format_duration(duration_str):
+    """Format ISO 8601 duration to readable format"""
+    if not duration_str:
+        return "N/A"
+    
+    # Simple parser for PT format (e.g., "PT2H30M")
+    duration_str = duration_str.replace('PT', '')
+    hours = 0
+    minutes = 0
+    
+    if 'H' in duration_str:
+        parts = duration_str.split('H')
+        hours = int(parts[0])
+        if len(parts) > 1 and 'M' in parts[1]:
+            minutes = int(parts[1].replace('M', ''))
+    elif 'M' in duration_str:
+        minutes = int(duration_str.replace('M', ''))
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
+
+def extract_date_from_filename(filepath):
+    """Extract date from filename like 2025-08-29.json"""
+    filename = os.path.basename(filepath)
+    if filename.endswith('.json'):
+        date_part = filename[:-5]  # Remove .json
+        try:
+            # Validate it's a proper date
+            datetime.strptime(date_part, '%Y-%m-%d')
+            return date_part
+        except ValueError:
+            pass
+    return "Unknown"
+
+def process_json_file(filepath):
+    """Process a single JSON file and extract flight data"""
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        return []
+    
+    flights = []
+    run_date = extract_date_from_filename(filepath)
+    
+    # Process each route in the JSON
+    for route_data in data.get('routes', []):
+        route = route_data.get('route', {})
+        route_flights = route_data.get('flights', [])
+        
+        for flight in route_flights:
+            flight_info = {
+                'run_date': run_date,
+                'route_from': route.get('from', ''),
+                'route_to': route.get('to', ''),
+                'airline_code': flight.get('airline_code', ''),
+                'flight_number': flight.get('flight_number', ''),
+                'departure_time': flight.get('departure_time', ''),
+                'arrival_time': flight.get('arrival_time', ''),
+                'next_day': 'Yes' if flight.get('next_day', False) else 'No',
+                'duration': format_duration(flight.get('duration', '')),
+                'stops': flight.get('stops', 0),
+                'price': f"{flight.get('price', '')} {flight.get('currency', '')}",
+                'fare_code': flight.get('fare_code', '')
+            }
+            flights.append(flight_info)
+    
+    return flights
+
+def print_flights_table(flights):
+    """Print flights in table format"""
+    if not flights:
+        print("No flights found")
+        return
+    
+    # Print header
+    print("=" * 150)
+    print(f"{'Run Date':<12} {'Route':<8} {'Airline':<10} {'Flight':<15} {'Departure':<10} {'Arrival':<10} {'Next Day':<9} {'Duration':<10} {'Stops':<6} {'Price':<12} {'Fare Code':<15}")
+    print("-" * 150)
+    
+    # Print flights
+    for flight in flights:
+        route = f"{flight['route_from']}-{flight['route_to']}"
+        print(f"{flight['run_date']:<12} {route:<8} {flight['airline_code']:<10} {flight['flight_number']:<15} {flight['departure_time']:<10} {flight['arrival_time']:<10} {flight['next_day']:<9} {flight['duration']:<10} {flight['stops']:<6} {flight['price']:<12} {flight['fare_code']:<15}")
+
+def get_json_files(path):
+    """Get list of JSON files from path (file or directory)"""
+    if os.path.isfile(path):
+        if path.endswith('.json'):
+            return [path]
+        else:
+            print(f"Error: {path} is not a JSON file", file=sys.stderr)
+            return []
+    elif os.path.isdir(path):
+        # Find all JSON files in directory
+        pattern = os.path.join(path, '*.json')
+        json_files = glob.glob(pattern)
+        if not json_files:
+            print(f"Error: No JSON files found in {path}", file=sys.stderr)
+        return sorted(json_files)  # Sort for consistent ordering
+    else:
+        print(f"Error: {path} does not exist", file=sys.stderr)
+        return []
+
+def main():
+    parser = argparse.ArgumentParser(description='Dump flight data from JSON files in table format')
+    parser.add_argument('path', 
+                       help='JSON file or directory containing JSON files')
+    parser.add_argument('--sort-by', choices=['date', 'price', 'duration', 'departure'], 
+                       default='date', help='Sort flights by field (default: date)')
+    parser.add_argument('--route', help='Filter by route (e.g., JFK-SFO)')
+    
+    args = parser.parse_args()
+    
+    # Get list of JSON files to process
+    json_files = get_json_files(args.path)
+    if not json_files:
+        sys.exit(1)
+    
+    # Process all files and collect flights
+    all_flights = []
+    for filepath in json_files:
+        flights = process_json_file(filepath)
+        all_flights.extend(flights)
+    
+    # Filter by route if specified
+    if args.route:
+        route_parts = args.route.split('-')
+        if len(route_parts) == 2:
+            from_code, to_code = route_parts
+            all_flights = [f for f in all_flights 
+                         if f['route_from'] == from_code and f['route_to'] == to_code]
+        else:
+            print(f"Error: Invalid route format '{args.route}'. Use format like 'JFK-SFO'", file=sys.stderr)
+            sys.exit(1)
+    
+    # Sort flights
+    if args.sort_by == 'date':
+        all_flights.sort(key=lambda x: (x['run_date'], x['departure_time']))
+    elif args.sort_by == 'price':
+        all_flights.sort(key=lambda x: float(x['price'].split()[0]) if x['price'].split()[0].replace('.', '').isdigit() else 0)
+    elif args.sort_by == 'duration':
+        all_flights.sort(key=lambda x: x['duration'])
+    elif args.sort_by == 'departure':
+        all_flights.sort(key=lambda x: x['departure_time'])
+    
+    # Print results
+    print_flights_table(all_flights)
+    
+    print(f"\nTotal flights: {len(all_flights)}")
+    if args.route:
+        print(f"Route filter: {args.route}")
+    print(f"Files processed: {len(json_files)}")
+
+if __name__ == "__main__":
+    main()
