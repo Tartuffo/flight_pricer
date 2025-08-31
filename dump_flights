@@ -61,8 +61,12 @@ def process_json_file(filepath):
         route_flights = route_data.get('flights', [])
         
         for flight in route_flights:
+            # Get departure date - prefer departure_date_requested, fall back to departure_date
+            departure_date = flight.get('departure_date_requested', flight.get('departure_date', 'N/A'))
+            
             flight_info = {
                 'run_date': run_date,
+                'departure_date': departure_date,
                 'route_from': route.get('from', ''),
                 'route_to': route.get('to', ''),
                 'airline_code': flight.get('airline_code', ''),
@@ -87,13 +91,13 @@ def print_flights_table(flights):
     
     # Print header
     print("=" * 150)
-    print(f"{'Run Date':<12} {'Route':<8} {'Airline':<10} {'Flight':<15} {'Departure':<10} {'Arrival':<10} {'Next Day':<9} {'Duration':<10} {'Stops':<6} {'Price':<12} {'Fare Code':<15}")
+    print(f"{'Run Date':<12} {'Dep Date':<10} {'Route':<8} {'IATA':<6} {'Flight':<15} {'Depart':<8} {'Arrive':<8} {'Next Day':<9} {'Duration':<10} {'Stops':<6} {'Price':<12} {'Fare Code':<15}")
     print("-" * 150)
     
     # Print flights
     for flight in flights:
         route = f"{flight['route_from']}-{flight['route_to']}"
-        print(f"{flight['run_date']:<12} {route:<8} {flight['airline_code']:<10} {flight['flight_number']:<15} {flight['departure_time']:<10} {flight['arrival_time']:<10} {flight['next_day']:<9} {flight['duration']:<10} {flight['stops']:<6} {flight['price']:<12} {flight['fare_code']:<15}")
+        print(f"{flight['run_date']:<12} {flight['departure_date']:<10} {route:<8} {flight['airline_code']:<6} {flight['flight_number']:<15} {flight['departure_time']:<8} {flight['arrival_time']:<8} {flight['next_day']:<9} {flight['duration']:<10} {flight['stops']:<6} {flight['price']:<12} {flight['fare_code']:<15}")
 
 def get_json_files(path):
     """Get list of JSON files from path (file or directory)"""
@@ -148,7 +152,7 @@ def main():
     
     # Sort flights
     if args.sort_by == 'date':
-        all_flights.sort(key=lambda x: (x['run_date'], x['departure_time']))
+        all_flights.sort(key=lambda x: (x['run_date'], x['departure_date'], x['departure_time']))
     elif args.sort_by == 'price':
         all_flights.sort(key=lambda x: float(x['price'].split()[0]) if x['price'].split()[0].replace('.', '').isdigit() else 0)
     elif args.sort_by == 'duration':
