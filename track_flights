@@ -5,8 +5,54 @@ import yaml
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from amadeus import Client, ResponseError
+
+def parse_departure_dates(departure_dates_str):
+    """Parse departure dates string - supports comma-separated dates and date ranges"""
+    if not departure_dates_str:
+        return []
+    
+    dates = []
+    for date_part in departure_dates_str.split(','):
+        date_part = date_part.strip()
+        
+        # Check if it's a date range (contains '-' but not at start for negative dates)
+        if '-' in date_part and not date_part.startswith('-'):
+            # Split on last dash to handle ISO dates with dashes
+            parts = date_part.rsplit('-', 1)
+            if len(parts) == 2:
+                try:
+                    # Try to parse as date range
+                    start_date_str = parts[0].strip()
+                    end_date_str = parts[1].strip()
+                    
+                    # Parse start date
+                    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                    
+                    # Parse end date - if only day is given, use same year/month as start
+                    if len(end_date_str) <= 2 and end_date_str.isdigit():
+                        # Only day provided, use same year/month as start date
+                        end_date = start_date.replace(day=int(end_date_str))
+                    else:
+                        # Full date provided
+                        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+                    
+                    # Generate all dates in range (inclusive)
+                    current_date = start_date
+                    while current_date <= end_date:
+                        dates.append(current_date.strftime('%Y-%m-%d'))
+                        current_date += timedelta(days=1)
+                    
+                    continue
+                except ValueError:
+                    # If parsing as range fails, treat as single date
+                    pass
+        
+        # Single date
+        dates.append(date_part)
+    
+    return dates
 
 def load_secrets(environment):
     """Load API credentials from secrets file"""
@@ -22,10 +68,10 @@ def load_secrets(environment):
         print(f"Error: Missing key {e} in {secrets_file}")
         sys.exit(1)
 
-def load_config():
+def load_config(config_file):
     """Load flight search configuration"""
     try:
-        with open('config.yaml', 'r') as f:
+        with open(config_file, 'r') as f:
             config_data = yaml.safe_load(f)
             
         # Extract metadata and itineraries
@@ -38,20 +84,20 @@ def load_config():
             
         return metadata, itineraries
     except FileNotFoundError:
-        print("Error: config.yaml not found")
+        print(f"Error: {config_file} not found")
         sys.exit(1)
     except KeyError as e:
         print(f"Error: Invalid config structure - {e}")
         sys.exit(1)
 
-def search_flights(amadeus_client, route_config):
+def search_flights(amadeus_client, route_config, departure_date):
     """Search for flights using Amadeus API"""
     try:
         # Build search parameters
         search_params = {
             'originLocationCode': route_config['from'],
             'destinationLocationCode': route_config['to'],
-            'departureDate': route_config['target_date'],
+            'departureDate': departure_date,
             'adults': 1,
             'currencyCode': route_config.get('currency', 'USD'),
             'max': 250  # Maximum number of flight offers to return
@@ -136,13 +182,13 @@ def filter_flights_by_duration(flights, max_duration_hours, route_max_duration=N
     
     return filtered_flights
 
-def display_flight_info(flights, route_config):
+def display_flight_info(flights, route_config, departure_date):
     """Display flight information in a formatted table"""
     if not flights:
         print("No flights found")
         return
     
-    print(f"\nFlights from {route_config['from']} to {route_config['to']} on {route_config['target_date']}")
+    print(f"\nFlights from {route_config['from']} to {route_config['to']} on {departure_date}")
     print("=" * 135)
     print(f"{'Airline':<15} {'Flight':<15} {'Departure':<12} {'Arrival':<12} {'Next Day':<9} {'Duration':<10} {'Stops':<6} {'Price':<12} {'Fare Code':<15}")
     print("-" * 135)
@@ -290,8 +336,16 @@ def main():
                        help='Environment to use (test or prod)')
     parser.add_argument('output_dir', 
                        help='Base output directory (will be suffixed with -[environment])')
+    parser.add_argument('--config', 
+                       help='Config file to use (default: config-{environment}.yaml)')
     
     args = parser.parse_args()
+    
+    # Determine config file to use
+    if args.config:
+        config_file = args.config
+    else:
+        config_file = f"config-{args.environment}.yaml"
     
     # Create environment-specific output directory
     output_dir = f"{args.output_dir.rstrip('/')}-{args.environment}"
@@ -299,7 +353,7 @@ def main():
     
     # Load credentials and configuration
     api_key, api_secret = load_secrets(args.environment)
-    config_metadata, itineraries = load_config()
+    config_metadata, itineraries = load_config(config_file)
     
     # Initialize Amadeus client
     amadeus_client = Client(
@@ -314,7 +368,7 @@ def main():
         "metadata": {
             "script_run_time": now.strftime('%Y-%m-%d %H:%M:%S'),
             "environment": args.environment,
-            "config_file": "config.yaml",
+            "config_file": config_file,
             "max_duration_hours": config_metadata.get('max_duration_hours', 10)
         },
         "routes": []
@@ -322,28 +376,43 @@ def main():
     
     print(f"Flight Price Tracker - {args.environment.upper()} Environment")
     print(f"Timestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Config file: {config_file}")
     print(f"Output directory: {output_dir}")
     print(f"Max duration filter: {config_metadata.get('max_duration_hours', 10)} hours")
     
     # Process each route in the configuration
     for route in itineraries:
-        flights = search_flights(amadeus_client, route)
+        # Parse departure dates from comma-separated string (supports ranges)
+        departure_dates_str = route.get('departure_dates', '')
+        if not departure_dates_str:
+            print(f"Error: No departure_dates specified for route {route['from']} -> {route['to']}")
+            continue
+            
+        departure_dates = parse_departure_dates(departure_dates_str)
         
-        # Apply duration filtering
-        route_max_duration = route.get('max_duration_hours')
-        global_max_duration = config_metadata.get('max_duration_hours', 10)
-        filtered_flights = filter_flights_by_duration(flights, global_max_duration, route_max_duration)
-        
-        # Show filtering results
-        if flights and len(filtered_flights) != len(flights):
-            max_used = route_max_duration if route_max_duration is not None else global_max_duration
-            print(f"Filtered {len(flights) - len(filtered_flights)} flights longer than {max_used} hours")
-        
-        display_flight_info(filtered_flights, route)
-        print()
-        
-        # Convert flights to JSON format and add to output
-        json_flights = convert_flights_to_json(filtered_flights, route)
+        # Process each departure date
+        all_flights_for_route = []
+        for departure_date in departure_dates:
+            flights = search_flights(amadeus_client, route, departure_date)
+            
+            # Apply duration filtering
+            route_max_duration = route.get('max_duration_hours')
+            global_max_duration = config_metadata.get('max_duration_hours', 10)
+            filtered_flights = filter_flights_by_duration(flights, global_max_duration, route_max_duration)
+            
+            # Show filtering results
+            if flights and len(filtered_flights) != len(flights):
+                max_used = route_max_duration if route_max_duration is not None else global_max_duration
+                print(f"Filtered {len(flights) - len(filtered_flights)} flights longer than {max_used} hours")
+            
+            display_flight_info(filtered_flights, route, departure_date)
+            print()
+            
+            # Convert flights to JSON format and add departure date info
+            json_flights = convert_flights_to_json(filtered_flights, route)
+            for flight in json_flights:
+                flight['departure_date_requested'] = departure_date
+            all_flights_for_route.extend(json_flights)
         
         # Ensure route config is JSON-serializable
         json_route = {}
@@ -357,8 +426,8 @@ def main():
         
         route_data = {
             "route": json_route,
-            "flights": json_flights,
-            "flight_count": len(json_flights)
+            "flights": all_flights_for_route,
+            "flight_count": len(all_flights_for_route)
         }
         json_output["routes"].append(route_data)
     
